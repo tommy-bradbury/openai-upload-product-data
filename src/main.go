@@ -39,6 +39,42 @@ type OutputCategory struct {
 	AttributesList AttributesList `json:"attributes_list"`
 }
 
+type OpenAIClient struct {
+	client               *openai.Client
+	assistantID          string
+	productsJSONFileName string
+}
+
+// initialise and returns a new OpenAIClient.
+func NewOpenAIClient() (*OpenAIClient, error) {
+	assistantID := os.Getenv("ASSISTANT_PRODUCT_PICKER")
+	if assistantID == "" {
+		return nil, fmt.Errorf("ASSISTANT_PRODUCT_PICKER environment variable not set")
+	}
+
+	openAICredential := os.Getenv("OPEN_AI_CREDENTIAL")
+	if openAICredential == "" {
+		return nil, fmt.Errorf("OPEN_AI_CREDENTIAL environment variable not set")
+	}
+
+	productsJSONFileName := os.Getenv("PRODUCTS_FILE_NAME")
+	if productsJSONFileName == "" {
+		return nil, fmt.Errorf("PRODUCTS_FILE_NAME environment variable not set")
+	}
+
+	// Configure the client to use Assistants API v2
+	config := openai.DefaultConfig(openAICredential)
+	config.AssistantVersion = "v2"
+
+	client := openai.NewClientWithConfig(config)
+
+	return &OpenAIClient{
+		client:               client,
+		assistantID:          assistantID,
+		productsJSONFileName: productsJSONFileName,
+	}, nil
+}
+
 func main() {
 	lambda.Start(handleRequest)
 }
@@ -60,7 +96,6 @@ func handleRequest() error {
 
 	if err != nil {
 		return fmt.Errorf("failed to replace products json file on open ai: %v", err)
-
 	}
 
 	return nil
@@ -128,97 +163,144 @@ func convertProductFormat(products *dynamodb.ScanOutput) []OutputCategory {
 }
 
 func replaceProductsJSONFileInOpenAI(JSONBytes []byte) error {
-	assistantID := os.Getenv("ASSISTANT_PRODUCT_PICKER")
+	ctx := context.TODO()
 
-	if assistantID == "" {
-		return fmt.Errorf("ASSISTANT_PRODUCT_PICKER environment variable not set")
-	}
-
-	openAICredential := os.Getenv("OPEN_AI_CREDENTIAL")
-	if openAICredential == "" {
-		return fmt.Errorf("OPEN_AI_CREDENTIAL environment variable not set")
-	}
-
-	productsJSONFileName := os.Getenv("PRODUCTS_FILE_NAME")
-	if productsJSONFileName == "" {
-		return fmt.Errorf("PRODUCTS_FILE_NAME environment variable not set")
-	}
-
-	config := openai.DefaultConfig(openAICredential)
-	config.AssistantVersion = "v2"
-	config.APIVersion = "v2"
-	client := openai.NewClientWithConfig(config)
-	var fileToDeleteID string
-
-	// @TODO: "failed to replace products json file on open ai: error listing assistant files: error, status code: 400, status: 400 Bad Request, message: The v1 Assistants API has been deprecated. See the migration guide for more information: https://platform.openai.com/docs/assistants/migration."
-	// consider alternatives and that innit
-	files, err := client.ListAssistantFiles(context.TODO(), assistantID, nil, nil, nil, nil)
+	oc, err := NewOpenAIClient()
 	if err != nil {
-		return fmt.Errorf("error listing assistant files: %w", err)
+		return fmt.Errorf("failed to initialize OpenAI client: %w", err)
 	}
 
-	for _, file := range files.AssistantFiles {
-		if file.Object == productsJSONFileName {
+	vectorStoreID, err := oc.getAssistantVectorStoreID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get or create assistant's vector store: %w", err)
+	}
+
+	existingFiles, err := oc.listFilesInVectorStore(ctx, vectorStoreID)
+	if err != nil {
+		return fmt.Errorf("failed to list files in vector store: %w", err)
+	}
+
+	var fileToDeleteID string
+	for _, file := range existingFiles {
+
+		fileDetails, fileErr := oc.client.GetFile(ctx, file.ID) // Direct call on client
+		if fileErr != nil {
+			log.Printf("Warning: Could not retrieve details for file %s in vector store: %v", file.ID, fileErr)
+			continue // Skip this file if details can't be retrieved
+		}
+
+		if fileDetails.FileName == oc.productsJSONFileName {
 			fileToDeleteID = file.ID
-			log.Printf("Found existing file '%s' with File ID: %s attached to assistant. Detaching and deleting...\n", productsJSONFileName, fileToDeleteID)
-
-			// Detach the file from the assistant first
-			err := client.DeleteAssistantFile(context.TODO(), assistantID, fileToDeleteID)
-			if err != nil {
-				return fmt.Errorf("error deleting file %s from assistant %s: %w", fileToDeleteID, assistantID, err)
+			log.Printf("Found existing file '%s' with File ID: %s in Vector Store. Detaching and deleting...\n", oc.productsJSONFileName, fileToDeleteID)
+			if err := oc.deleteFileFromOpenAIAndVectorStore(ctx, vectorStoreID, fileToDeleteID); err != nil {
+				return fmt.Errorf("failed to delete old file from vector store and storage: %w", err)
 			}
-			log.Printf("Successfully detached file %s from assistant.\n", fileToDeleteID)
-
-			// Then delete the file from OpenAI's general file storage
-			err = client.DeleteFile(context.TODO(), fileToDeleteID)
-			if err != nil {
-				return fmt.Errorf("error deleting file %s from OpenAI storage: %w", fileToDeleteID, err)
-			}
-			log.Printf("Successfully deleted file %s from OpenAI storage.\n", fileToDeleteID)
 			break
 		}
 	}
 
 	if fileToDeleteID == "" {
-		log.Printf("No existing file '%s' found. Still finna upload tho.\n", productsJSONFileName)
+		log.Printf("No existing file '%s' found in Vector Store. Proceeding with upload.\n", oc.productsJSONFileName)
 	}
 
-	uploadReq := openai.FileBytesRequest{
-		Name:    productsJSONFileName,
-		Bytes:   JSONBytes,
-		Purpose: purpose,
-	}
-
-	uploadedFile, err := client.CreateFileBytes(context.TODO(), uploadReq)
+	fileId, err := oc.uploadFileToOpenAIAndVectorStore(ctx, vectorStoreID, JSONBytes)
 	if err != nil {
-		return fmt.Errorf("error uploading file: %w", err)
+		return fmt.Errorf("failed to upload and attach new products file: %w", err)
 	}
 
-	// attach new file to assistant
-	attachReq := openai.AssistantFileRequest{
-		FileID: uploadedFile.ID,
-	}
-	_, err = client.CreateAssistantFile(context.TODO(), assistantID, attachReq)
+	updatedFiles, err := oc.listFilesInVectorStore(ctx, vectorStoreID)
 	if err != nil {
-		return fmt.Errorf("error attaching file %s to assistant %s: %w", uploadedFile.ID, assistantID, err)
+		return fmt.Errorf("error listing vector store files after upload: %w", err)
 	}
 
-	// verify file is attached to assistant
-	updatedAssistantFiles, err := client.ListAssistantFiles(context.TODO(), assistantID, nil, nil, nil, nil)
+	JSONTing, err := json.Marshal(updatedFiles)
 	if err != nil {
-		return fmt.Errorf("error listing assistant files after attachment: %w", err)
+		return fmt.Errorf("failed to marshal JSON output: %v", err)
 	}
+
+	log.Print(string(JSONTing))
 	found := false
-	for _, file := range updatedAssistantFiles.AssistantFiles {
-		if file.Object == productsJSONFileName {
+	for _, file := range updatedFiles {
+		if file.ID == fileId {
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		return fmt.Errorf("file uploaded but attaching to assistant failed")
+		return fmt.Errorf("file uploaded but attaching to vector store failed or verification issue")
 	}
 
+	log.Println("Successfully replaced products JSON file in OpenAI via Vector Store.")
 	return nil
+}
+
+// get id of Vector Store for assistant
+// ASSUMES one already exists
+func (oc *OpenAIClient) getAssistantVectorStoreID(ctx context.Context) (string, error) {
+	assistant, err := oc.client.RetrieveAssistant(ctx, oc.assistantID)
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve assistant %s: %w", oc.assistantID, err)
+	}
+
+	// vector storage stuff is found within the nested ToolResources field of the Assistant struct.
+	// These are accessed directly as fields of the `assistant` object.
+	if assistant.ToolResources != nil &&
+		assistant.ToolResources.FileSearch != nil &&
+		len(assistant.ToolResources.FileSearch.VectorStoreIDs) > 0 {
+		vectorStoreID := assistant.ToolResources.FileSearch.VectorStoreIDs[0]
+		log.Printf("Found existing Vector Store ID: %s associated with assistant.", vectorStoreID)
+		return vectorStoreID, nil
+	}
+	return "", nil
+}
+
+func (oc *OpenAIClient) listFilesInVectorStore(ctx context.Context, vectorStoreID string) ([]openai.VectorStoreFile, error) {
+
+	limit := 1 // should only be one thing in there
+	var cursor *string
+	orderBy := "desc"
+	filesList, err := oc.client.ListVectorStoreFiles(ctx, vectorStoreID, openai.Pagination{
+		Limit: &limit,
+		After: cursor,
+		Order: &orderBy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error listing files in Vector Store %s: %w", vectorStoreID, err)
+	}
+	return filesList.VectorStoreFiles, nil
+}
+
+func (oc *OpenAIClient) deleteFileFromOpenAIAndVectorStore(ctx context.Context, vectorStoreID, fileID string) error {
+	err := oc.client.DeleteVectorStoreFile(ctx, vectorStoreID, fileID)
+	if err != nil {
+		return fmt.Errorf("error deleting file %s from Vector Store %s: %w", fileID, vectorStoreID, err)
+	}
+
+	err = oc.client.DeleteFile(ctx, fileID)
+	if err != nil {
+		return fmt.Errorf("error deleting file %s from OpenAI storage: %w", fileID, err)
+	}
+	return nil
+}
+
+func (oc *OpenAIClient) uploadFileToOpenAIAndVectorStore(ctx context.Context, vectorStoreID string, JSONBytes []byte) (string, error) {
+	uploadReq := openai.FileBytesRequest{
+		Name:    oc.productsJSONFileName,
+		Bytes:   JSONBytes,
+		Purpose: purpose,
+	}
+
+	uploadedFile, err := oc.client.CreateFileBytes(ctx, uploadReq)
+	if err != nil {
+		return "", fmt.Errorf("error uploading file to OpenAI storage: %w", err)
+	}
+	attachReq := openai.VectorStoreFileRequest{
+		FileID: uploadedFile.ID,
+	}
+	_, err = oc.client.CreateVectorStoreFile(ctx, vectorStoreID, attachReq)
+	if err != nil {
+		return "", fmt.Errorf("error attaching file %s to Vector Store %s: %w", uploadedFile.ID, vectorStoreID, err)
+	}
+	return uploadedFile.ID, nil
 }
